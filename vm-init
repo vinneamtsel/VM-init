@@ -113,6 +113,16 @@ apt_install() {
   fi
 }
 
+wait_for_apt() {
+  command -v fuser >/dev/null 2>&1 || return 0
+  local i
+  for i in $(seq 1 60); do
+    fuser /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock >/dev/null 2>&1 || return 0
+    sleep 2
+  done
+  die "apt is locked by another process (waited 120s)"
+}
+
 # ---- phase 1: collect answers (no changes) ------------------------------
 
 collect() {
@@ -170,7 +180,7 @@ collect() {
   EXTRA_PORTS=
   if confirm "Enable firewall (ufw, default deny incoming)" y; then
     UFW_ENABLE=y
-    EXTRA_PORTS=$(ask "Extra ports to allow, comma separated (e.g. 80,443)" "")
+    EXTRA_PORTS=$(ask "Extra ports to allow (SSH is always open, e.g. 80,443)" "80,443")
   fi
 
   echo; info "== Question 5/9: Software =="
@@ -249,6 +259,10 @@ show_plan() {
 # ---- phase 2: execute (no prompts) --------------------------------------
 
 execute() {
+  export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a APT_LISTCHANGES_FRONTEND=none
+  # stop apt daily timers so they don't grab the dpkg lock while we upgrade
+  systemctl stop apt-daily.timer apt-daily-upgrade.timer 2>/dev/null || true
+
   # ---- 1/9 identity ----
   STEP="identity"
   echo; info "=== 1/9 Identity ==="
@@ -299,6 +313,7 @@ execute() {
       fi
     fi
   } > /etc/netplan/99-vm-init.yaml
+  chmod 600 /etc/netplan/99-vm-init.yaml
   netplan generate || die "Invalid netplan config in /etc/netplan/99-vm-init.yaml. Re-run to fix."
   ok "Netplan written and validated (applied at the end)"
 
@@ -336,35 +351,40 @@ execute() {
   fi
 
   if [[ $UFW_ENABLE == y ]]; then
-    local port p
+    local port p allow
     port=$(sshd -T 2>/dev/null | awk '/^port /{print $2}' || echo 22)
     port=${port:-22}
     command -v ufw >/dev/null 2>&1 || apt-get install -y -q ufw >/dev/null
     ufw allow "$port/tcp" >/dev/null
+    allow=("$port/tcp")
     IFS=',' read -ra extra_ports <<< "$EXTRA_PORTS"
     for p in "${extra_ports[@]}"; do
       p=${p// /}
-      [[ -n $p ]] && (ufw allow "$p" >/dev/null || warn "ufw could not allow $p")
+      if [[ -n $p && $p != "$port" ]]; then
+        if ufw allow "$p" >/dev/null; then
+          allow+=("$p")
+        else
+          warn "ufw could not allow $p"
+        fi
+      fi
     done
     ufw --force enable >/dev/null
-    ok "ufw enabled (allowed: ${port}/tcp${EXTRA_PORTS:+, $EXTRA_PORTS})"
+    ok "ufw enabled (allowed: $(IFS=,; printf '%s' "${allow[*]}"))"
   fi
 
   info "Installing fail2ban and unattended-upgrades ..."
+  wait_for_apt
   DEBIAN_FRONTEND=noninteractive apt-get install -y -q fail2ban unattended-upgrades >/dev/null
-  cat > /etc/apt/apt.conf.d/20auto-upgrades <<'EOF'
-APT::Periodic::Update-Package-Lists "1";
-APT::Periodic::Unattended-Upgrade "1";
-EOF
   systemctl enable --now fail2ban >/dev/null 2>&1 || true
-  ok "fail2ban and unattended-upgrades enabled"
+  ok "fail2ban enabled (unattended-upgrades is armed after the full upgrade)"
 
   # ---- 5/9 packages ----
   STEP="packages"
   echo; info "=== 5/9 System update and software ==="
-  export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a APT_LISTCHANGES_FRONTEND=none
   info "Running apt update + full upgrade (this can take a while) ..."
+  wait_for_apt
   apt-get update -q
+  wait_for_apt
   apt-get upgrade -y -q
   apt-get install -y -q \
     curl wget git vim htop unzip jq rsync net-tools \
@@ -519,6 +539,12 @@ EOF
   fi
   DEBIAN_FRONTEND=noninteractive apt-get autoremove -y -q >/dev/null || true
   apt-get clean
+  cat > /etc/apt/apt.conf.d/20auto-upgrades <<'EOF'
+APT::Periodic::Update-Package-Lists "1";
+APT::Periodic::Unattended-Upgrade "1";
+EOF
+  systemctl start apt-daily.timer apt-daily-upgrade.timer 2>/dev/null || true
+  ok "unattended-upgrades enabled (daily timers restarted)"
   journalctl --vacuum-size=50M >/dev/null 2>&1 || true
   find /var/log -type f -name '*.gz' -delete 2>/dev/null || true
   : > /root/.bash_history 2>/dev/null || true
