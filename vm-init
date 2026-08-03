@@ -1,0 +1,478 @@
+#!/usr/bin/env bash
+#
+# vm-init - one-shot initial setup for a freshly cloned Ubuntu 24.04 VM.
+#
+# Usage:
+#   sudo vm-init
+#
+# Walks you through: identity, network, time, security, packages, MOTD,
+# swap, disk resize, cleanup. Every prompt shows a default; press Enter
+# to accept it. The network change is applied last, so an SSH session
+# survives until the very end (a static IP switch drops the connection).
+#
+# Safe to re-run. Steps that are already done are skipped or idempotent.
+#
+set -euo pipefail
+
+GREEN=$'\033[32m'; YELLOW=$'\033[33m'; RED=$'\033[31m'; BOLD=$'\033[1m'; NC=$'\033[0m'
+
+info() { printf '%s[*]%s %s\n' "$GREEN" "$NC" "$*"; }
+ok()   { printf '%s[+]%s %s\n' "$GREEN" "$NC" "$*"; }
+warn() { printf '%s[!]%s %s\n' "$YELLOW" "$NC" "$*"; }
+err()  { printf '%s[x]%s %s\n' "$RED" "$NC" "$*" >&2; }
+die()  { err "$*"; exit 1; }
+
+# ask QUESTION DEFAULT -> echoes the answer (DEFAULT on plain Enter)
+ask() {
+  local q="$1" d="${2:-}" ans
+  if [[ -n $d ]]; then
+    read -r -p "$q [$d]: " ans
+    echo "${ans:-$d}"
+  else
+    read -r -p "$q: " ans
+    echo "$ans"
+  fi
+}
+
+# confirm QUESTION DEFAULT_IS_YES -> 0 for yes, 1 for no
+confirm() {
+  local q="$1" d="${2:-y}" ans
+  read -r -p "$q [$([ "$d" = y ] && echo Y/n || echo y/N)]: " ans
+  case "${ans,,}" in
+    y|yes) return 0 ;;
+    n|no)  return 1 ;;
+    *)     [[ $d == y ]] ;;
+  esac
+}
+
+STEP="startup"
+trap 'err "vm-init failed during: ${STEP:-unknown}"' ERR
+
+# ---- optional software --------------------------------------------------
+
+install_docker() {
+  command -v docker >/dev/null 2>&1 && { ok "Docker already installed"; return; }
+  info "Installing Docker via https://get.docker.com ..."
+  curl -fsSL https://get.docker.com | sh
+  for u in "${SUDO_USER:-}" "$ADMIN_USER"; do
+    [[ -n $u && $u != root ]] && usermod -aG docker "$u"
+  done
+  ok "Docker installed (docker group: ${SUDO_USER:-} ${ADMIN_USER:-})"
+}
+
+install_node() {
+  command -v node >/dev/null 2>&1 && { ok "Node already installed"; return; }
+  info "Installing nvm and Node LTS ..."
+  export NVM_DIR=/root/.nvm
+  curl -fsSL -o /tmp/nvm-install.sh \
+    https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.6/install.sh
+  bash /tmp/nvm-install.sh
+  # shellcheck source=/dev/null
+  . "$NVM_DIR/nvm.sh"
+  nvm install --lts
+  nvm alias default 'lts/*'
+  nvm use default
+  # system-wide symlinks so every user gets node/npm/npx
+  local node_bin
+  node_bin="$NVM_DIR/current/bin"
+  [[ -d $node_bin ]] || node_bin=$(dirname "$(nvm which default)")
+  if compgen -G "$node_bin"/* >/dev/null; then
+    ln -sf "$node_bin"/* /usr/local/bin/
+  fi
+  ok "Node $(node -v) installed via nvm (default: lts/*, nvm itself is root-only)"
+}
+
+apt_install() {
+  if DEBIAN_FRONTEND=noninteractive apt-get install -y -q "$1" >/dev/null; then
+    ok "$1 installed"
+  else
+    warn "Failed to install $1"
+  fi
+}
+
+# ---- main ---------------------------------------------------------------
+
+main() {
+  [[ $EUID -eq 0 ]] || exec sudo "$0" "$@"
+
+  # ---- preflight ----
+  STEP="preflight"
+  warn "Run this on a fresh clone. Existing hostname, netplan and SSH settings will be changed."
+  . /etc/os-release
+  if [[ ${ID:-} != ubuntu || ${VERSION_ID:-} != 24.04 ]]; then
+    warn "Targets Ubuntu 24.04, this is ${PRETTY_NAME:-unknown}. Continuing anyway."
+  fi
+  if ! ping -c1 -W2 archive.ubuntu.com >/dev/null 2>&1; then
+    warn "No network connectivity. If the clone has a stale IP this is expected; apt steps will fail loudly and can be re-run."
+  fi
+
+  # ---- 1/9 identity ----
+  STEP="identity"
+  echo; info "=== 1/9 Identity ==="
+  local current hostname_new rotate
+  current=$(hostname)
+  hostname_new=$(ask "New hostname" "$current")
+  rotate=0
+  if [[ $hostname_new != "$current" ]]; then
+    hostnamectl set-hostname "$hostname_new"
+    sed -i '/127.0.1.1/d' /etc/hosts
+    echo "127.0.1.1 $hostname_new" >> /etc/hosts
+    ok "Hostname set to $hostname_new"
+    rotate=1
+  else
+    confirm "Regenerate machine-id and SSH host keys" n && rotate=1
+  fi
+  if [[ $rotate -eq 1 ]]; then
+    rm -f /etc/machine-id /var/lib/dbus/machine-id
+    systemd-machine-id-setup >/dev/null 2>&1 || die "machine-id regeneration failed"
+    rm -f /etc/ssh/ssh_host_*
+    ssh-keygen -A >/dev/null 2>&1 || die "SSH host key regeneration failed"
+    ok "machine-id and SSH host keys regenerated"
+  else
+    info "Keeping machine-id and SSH host keys"
+  fi
+
+  # ---- 2/9 network ----
+  STEP="network"
+  echo; info "=== 2/9 Network ==="
+  local iface mode ip_cidr gw dns search
+  iface=$(ip route get 8.8.8.8 2>/dev/null | awk '{print $5; exit}' || true)
+  [[ -z $iface ]] && iface=$(ls /sys/class/net | grep -v '^lo$' | head -1 || true)
+  [[ -z $iface ]] && die "No network interface found."
+  info "Interface: $iface  current: $(ip -4 -o addr show "$iface" | awk '{print $4; exit}')"
+
+  if confirm "Use a static IP instead of DHCP" y; then
+    mode=static
+    ip_cidr=$(ask "Static IP/CIDR (e.g. 10.0.0.11/24)" "")
+    while [[ ! $ip_cidr =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}/[0-9]{1,2}$ ]]; do
+      warn "Invalid format, use IP/CIDR like 10.0.0.11/24"
+      ip_cidr=$(ask "Static IP/CIDR" "")
+    done
+    gw=$(ask "Gateway" "$(ip route | awk '/default/ {print $3; exit}')")
+    while [[ ! $gw =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; do
+      warn "Invalid gateway address"
+      gw=$(ask "Gateway" "")
+    done
+    dns=$(ask "DNS servers (comma or space separated)" "1.1.1.1, 8.8.8.8")
+    search=$(ask "Search domain(s) (optional)" "")
+    dns=$(printf '%s' "$dns" | tr -s ' ,' ',' | sed 's/^,\|,$//g')
+    [[ -n $search ]] && search=$(printf '%s' "$search" | tr -s ' ,' ',' | sed 's/^,\|,$//g')
+  else
+    mode=dhcp
+  fi
+
+  local renderer
+  if systemctl is-active --quiet NetworkManager; then renderer=NetworkManager; else renderer=networkd; fi
+  rm -f /etc/netplan/50-cloud-init.yaml
+  {
+    echo "network:"
+    echo "  version: 2"
+    echo "  renderer: $renderer"
+    echo "  ethernets:"
+    echo "    $iface:"
+    if [[ $mode == static ]]; then
+      echo "      dhcp4: false"
+      echo "      dhcp6: false"
+      echo "      addresses:"
+      echo "        - $ip_cidr"
+      echo "      routes:"
+      echo "        - to: default"
+      echo "          via: $gw"
+      echo "      nameservers:"
+      echo "        addresses: [${dns// /}]"
+      [[ -n $search ]] && echo "        search: [$search]"
+    else
+      echo "      dhcp4: true"
+      echo "      dhcp6: false"
+      if [[ $renderer == networkd ]]; then
+        echo "      dhcp-identifier: mac"
+      fi
+    fi
+  } > /etc/netplan/99-vm-init.yaml
+  netplan generate || die "Invalid netplan config in /etc/netplan/99-vm-init.yaml. Re-run to fix."
+  info "Netplan written to /etc/netplan/99-vm-init.yaml and validated (applied at the end)"
+
+  # ---- 3/9 time ----
+  STEP="time"
+  echo; info "=== 3/9 Time ==="
+  local tz
+  tz=$(ask "Timezone" "$(timedatectl show -p Timezone --value)")
+  timedatectl set-timezone "$tz"
+  timedatectl set-ntp true
+  ok "Timezone $tz, NTP enabled (systemd-timesyncd)"
+
+  # ---- 4/9 security ----
+  STEP="security"
+  echo; info "=== 4/9 Security ==="
+  ADMIN_USER=
+  if confirm "Create a new admin user (sudo)" y; then
+    ADMIN_USER=$(ask "Username" "admin")
+    if ! id "$ADMIN_USER" >/dev/null 2>&1; then
+      adduser --gecos "" "$ADMIN_USER"
+    fi
+    usermod -aG sudo "$ADMIN_USER"
+    ok "User $ADMIN_USER added to sudo"
+  fi
+
+  local ssh_opts=()
+  if ! confirm "Keep SSH password authentication enabled" y; then
+    ssh_opts+=("PasswordAuthentication no")
+  fi
+  if confirm "Disable root SSH login" y; then
+    ssh_opts+=("PermitRootLogin no")
+  fi
+  if [[ ${#ssh_opts[@]} -gt 0 ]]; then
+    # 00- sorts before cloud-init's 50- drop-in; sshd keeps the first value
+    printf '%s\n' "${ssh_opts[@]}" > /etc/ssh/sshd_config.d/00-vm-init.conf
+    rm -f /etc/ssh/sshd_config.d/99-vm-init.conf
+    systemctl restart ssh
+    ok "SSH hardened: ${ssh_opts[*]}"
+  else
+    rm -f /etc/ssh/sshd_config.d/00-vm-init.conf /etc/ssh/sshd_config.d/99-vm-init.conf
+    systemctl restart ssh
+  fi
+
+  if confirm "Enable firewall (ufw, default deny incoming)" y; then
+    local port extras p
+    port=$(sshd -T 2>/dev/null | awk '/^port /{print $2}' || echo 22)
+    port=${port:-22}
+    command -v ufw >/dev/null 2>&1 || apt-get install -y -q ufw >/dev/null
+    ufw allow "$port/tcp" >/dev/null
+    extras=$(ask "Extra ports to allow, comma separated (e.g. 80,443)" "")
+    IFS=',' read -ra extra_ports <<< "$extras"
+    for p in "${extra_ports[@]}"; do
+      p=${p// /}
+      [[ -n $p ]] && ufw allow "$p" >/dev/null
+    done
+    ufw --force enable >/dev/null
+    ok "ufw enabled (allowed: ${port}/tcp${extras:+, $extras})"
+  else
+    info "Firewall skipped"
+  fi
+
+  info "Installing fail2ban and unattended-upgrades ..."
+  DEBIAN_FRONTEND=noninteractive apt-get install -y -q fail2ban unattended-upgrades >/dev/null
+  cat > /etc/apt/apt.conf.d/20auto-upgrades <<'EOF'
+APT::Periodic::Update-Package-Lists "1";
+APT::Periodic::Unattended-Upgrade "1";
+EOF
+  systemctl enable --now fail2ban >/dev/null 2>&1 || true
+  ok "fail2ban and unattended-upgrades enabled"
+
+  # ---- 5/9 packages ----
+  STEP="packages"
+  echo; info "=== 5/9 System update and software ==="
+  export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a APT_LISTCHANGES_FRONTEND=none
+  info "Running apt update + full upgrade (this can take a while) ..."
+  apt-get update -q
+  apt-get upgrade -y -q
+  apt-get install -y -q \
+    curl wget git vim htop unzip jq rsync net-tools \
+    ca-certificates gnupg software-properties-common
+  ok "Base tools installed"
+
+  info "Installing herdr (terminal multiplexer, https://herdr.dev) ..."
+  if ! command -v herdr >/dev/null 2>&1; then
+    export HERDR_INSTALL_DIR=/usr/local/bin
+    curl -fsSL https://herdr.dev/install.sh | sh
+  fi
+  ok "herdr installed (system-wide at /usr/local/bin/herdr)"
+
+  echo
+  info "Optional software (comma separated numbers, 0 = none)"
+  echo "  1) Docker CE + Compose (get.docker.com)"
+  echo "  2) Node.js LTS via nvm"
+  echo "  3) Nginx (apt)"
+  echo "  4) python3-pip (apt)"
+  echo "  5) PostgreSQL (apt)"
+  local sel n
+  sel=$(ask "Select" "0")
+  if [[ $sel != 0 && -n $sel ]]; then
+    IFS=',' read -ra sels <<< "$sel"
+    for n in "${sels[@]}"; do
+      n=${n// /}
+      case "$n" in
+        1) install_docker || warn "Docker install failed" ;;
+        2) install_node || warn "Node install failed" ;;
+        3) apt_install nginx ;;
+        4) apt_install python3-pip ;;
+        5) apt_install postgresql ;;
+        *) warn "Unknown selection: $n" ;;
+      esac
+    done
+  else
+    info "No optional software selected"
+  fi
+
+  # ---- 6/9 MOTD ----
+  STEP="motd"
+  echo; info "=== 6/9 MOTD / welcome message ==="
+  cat > /etc/update-motd.d/99-vm-info <<'EOF'
+#!/bin/sh
+printf '\033[1;32mWelcome to %s\033[0m\n' "$(hostname)"
+echo '-------------------------------------------'
+echo "IP:      $(hostname -I 2>/dev/null | awk '{print $1}')"
+. /etc/os-release
+echo "OS:      $PRETTY_NAME"
+echo "Kernel:  $(uname -r)"
+echo "Uptime:  $(uptime -p | sed 's/up //')"
+df -h / | awk 'NR==2 {printf "Disk:    %s used of %s (%s)\n", $3, $2, $5}'
+free -h | awk 'NR==2 {printf "Memory:  %s used of %s\n", $3, $2}'
+updates=$(apt list --upgradable 2>/dev/null | wc -l)
+if [ "${updates:-0}" -gt 1 ] 2>/dev/null; then
+  echo "Updates: $((updates - 1)) pending (sudo apt upgrade)"
+fi
+EOF
+  chmod +x /etc/update-motd.d/99-vm-info
+  [[ -f /etc/default/motd-news ]] && sed -i 's/^ENABLED=.*/ENABLED=0/' /etc/default/motd-news
+
+  # colored two-line bash prompt: ╭── user@host ~/dir (branch) [exit N] / ╰─❯
+  if ! grep -q '_vm_init_prompt' /etc/bash.bashrc 2>/dev/null; then
+    cat >> /etc/bash.bashrc <<'EOF'
+
+# vm-init: two-line prompt with git branch and exit status
+_vm_init_prompt() {
+  local last=$?
+  local branch
+  branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null)
+  [[ -n $branch ]] && branch=" \[\e[33m\]($branch)\[\e[0m\]"
+  PS1="\[\e[36m\]╭──\[\e[0m\] \[\e[32m\]\u@\h\[\e[0m\] \[\e[34m\]\w\[\e[0m\]$branch"
+  if [[ $last -ne 0 ]]; then
+    PS1+=" \[\e[31m\][exit $last]\[\e[0m\]"
+  fi
+  PS1+=$'\n\[\e[36m\]╰─❯\[\e[0m\] '
+}
+PROMPT_COMMAND=_vm_init_prompt
+EOF
+  fi
+  ok "MOTD and bash prompt installed"
+
+  # ---- 7/9 swap ----
+  STEP="swap"
+  echo; info "=== 7/9 Swap ==="
+  if swapon --show | grep -q .; then
+    swapon --show | awk 'NR==1 || NR==2 {print}'
+    info "Swap already present, skipping"
+  elif confirm "Create a 2G swapfile (recommended for small VMs)" n; then
+    local size
+    size=$(ask "Swap size" "2G")
+    fallocate -l "$size" /swapfile
+    chmod 600 /swapfile
+    mkswap /swapfile >/dev/null
+    swapon /swapfile
+    grep -q '^/swapfile' /etc/fstab || echo '/swapfile none swap sw 0 0' >> /etc/fstab
+    echo 'vm.swappiness=10' > /etc/sysctl.d/99-swappiness.conf
+    sysctl -p /etc/sysctl.d/99-swappiness.conf >/dev/null
+    ok "Swapfile created ($size, swappiness 10)"
+  else
+    info "No swap configured"
+  fi
+
+  # ---- 8/9 disk resize ----
+  STEP="disk resize"
+  echo; info "=== 8/9 Disk resize ==="
+  local root_fs root_type part disk
+  root_fs=$(findmnt -no SOURCE /)
+  root_type=$(findmnt -no FSTYPE /)
+  if [[ $root_fs == /dev/mapper/* ]]; then
+    part=$(lsblk -no PKNAME "$root_fs" | head -1)
+    [[ -z $part ]] && part=$(pvs --noheadings -o pv_name 2>/dev/null | awk 'NR==1{print $1}' | sed 's#^/dev/##')
+  else
+    part=${root_fs#/dev/}
+  fi
+  disk=$(lsblk -no PKNAME "/dev/$part" 2>/dev/null | head -1)
+  if [[ -z $disk || -z $part ]]; then
+    warn "Could not determine the disk layout, skipping resize"
+  elif (( $(lsblk -bno SIZE "/dev/$part") < $(lsblk -bno SIZE "/dev/$disk") )); then
+    if confirm "Disk is larger than the filesystem, grow it (recommended)" y; then
+      local pnum suffix
+      command -v growpart >/dev/null 2>&1 || \
+        apt-get install -y -q cloud-guest-utils >/dev/null 2>&1 || true
+      if command -v growpart >/dev/null 2>&1; then
+        suffix=${part##*/}; suffix=${suffix#"$disk"}; pnum=${suffix//[^0-9]/}
+        if printf 'y\n' | growpart "/dev/$disk" "$pnum" >/dev/null 2>&1; then
+          if [[ $root_fs == /dev/mapper/* ]]; then
+            command -v pvresize >/dev/null 2>&1 && { pvresize "/dev/$part" >/dev/null; lvextend -l +100%FREE "$root_fs" >/dev/null; }
+          fi
+          if [[ $root_type == xfs ]]; then
+            xfs_growfs / >/dev/null
+          elif [[ $root_type == ext2 || $root_type == ext3 || $root_type == ext4 ]]; then
+            resize2fs "$root_fs" >/dev/null
+          else
+            warn "No online resize for $root_type, skipping"
+          fi
+          ok "Filesystem grown to $(df -h / | awk 'NR==2{print $2}')"
+        else
+          warn "growpart failed for /dev/$disk partition $pnum, resize skipped"
+        fi
+      else
+        warn "growpart unavailable, skipping resize"
+      fi
+    else
+      info "Disk resize skipped"
+    fi
+  else
+    info "Filesystem already uses the full disk"
+  fi
+
+  # ---- 9/9 cleanup ----
+  STEP="cleanup"
+  echo; info "=== 9/9 Cleanup ==="
+  if confirm "Remove cloud-init (you don't use it)" y; then
+    DEBIAN_FRONTEND=noninteractive apt-get purge -y -q cloud-init >/dev/null || true
+    rm -rf /etc/cloud /var/lib/cloud
+    rm -f /etc/netplan/50-cloud-init.yaml
+    ok "cloud-init removed"
+  else
+    warn "cloud-init kept: the machine-id changed, so it may re-run at next boot and rewrite netplan/SSH configs. If networking misbehaves, purge cloud-init and re-run vm-init."
+  fi
+  DEBIAN_FRONTEND=noninteractive apt-get autoremove -y -q >/dev/null || true
+  apt-get clean
+  journalctl --vacuum-size=50M >/dev/null 2>&1 || true
+  find /var/log -type f -name '*.gz' -delete 2>/dev/null || true
+  : > /root/.bash_history 2>/dev/null || true
+  ok "Cleanup done"
+
+  # ---- summary + apply ----
+  STEP="network apply"
+  echo
+  printf '%s=== Summary ===%s\n' "$BOLD" "$NC"
+  printf 'Hostname:  %s\n' "$(hostname)"
+  printf 'Interface: %s\n' "$iface"
+  if [[ $mode == static ]]; then
+    printf 'IP:        %s (gw %s, dns %s)\n' "$ip_cidr" "$gw" "$dns"
+  else
+    printf 'IP:        DHCP (reserve by MAC in your router)\n'
+  fi
+  printf 'Timezone:  %s\n' "$(timedatectl show -p Timezone --value)"
+  if command -v ufw >/dev/null 2>&1; then
+    printf 'Firewall:  %s\n' "$(ufw status | head -1)"
+  else
+    printf 'Firewall:  disabled\n'
+  fi
+  swapon --show | grep -q . \
+    && printf 'Swap:      %s\n' "$(swapon --show | awk 'NR==2{print $1" ("$2")"}')" \
+    || printf 'Swap:      none\n'
+  printf 'MOTD:      installed\n'
+
+  echo
+  if [[ $mode == static ]]; then
+    warn "Applying static IP: the SSH connection will drop and return on $ip_cidr"
+    if confirm "Reboot after applying (recommended)" y; then
+      systemd-run --on-active=5 reboot >/dev/null 2>&1 || die "Could not schedule reboot via systemd-run"
+      info "Reboot scheduled in 5 seconds"
+    fi
+    info "Applying network config ..."
+    netplan apply
+    echo
+    ok "Done. Reconnect to $ip_cidr (or use the Proxmox console). Re-run anytime: sudo vm-init"
+  else
+    netplan apply
+    if confirm "Reboot now (recommended)" y; then
+      reboot
+    fi
+    ok "Done. Re-run anytime: sudo vm-init"
+  fi
+}
+
+main "$@"
