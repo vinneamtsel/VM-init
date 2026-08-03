@@ -436,17 +436,31 @@ EOF
   chmod +x /etc/update-motd.d/99-vm-info
   [[ -f /etc/default/motd-news ]] && sed -i 's/^ENABLED=.*/ENABLED=0/' /etc/default/motd-news
 
+  # drop the stock Ubuntu MOTD blocks (header, help text, system info,
+  # ESM ads, updates count); only our welcome banner remains
+  rm -f /etc/update-motd.d/00-header \
+        /etc/update-motd.d/10-help-text \
+        /etc/update-motd.d/50-landscape-sysinfo \
+        /etc/update-motd.d/50-motd-news \
+        /etc/update-motd.d/80-esm \
+        /etc/update-motd.d/90-updates-available \
+        /etc/update-motd.d/91-release-upgrade \
+        /etc/update-motd.d/95-hwe-eol \
+        /etc/update-motd.d/98-fsck-at-reboot
+
   # colored two-line bash prompt: ╭── user@host ~/dir (branch) [exit N] / ╰─❯
   if ! grep -q '_vm_init_prompt' /etc/bash.bashrc 2>/dev/null; then
     cat >> /etc/bash.bashrc <<'EOF'
 
-# vm-init: two-line prompt with git branch and exit status
+# vm-init: two-line prompt with git branch and exit status; a blank line
+# separates every prompt from the previous command's output
 _vm_init_prompt() {
   local last=$?
   local branch
   branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null)
   [[ -n $branch ]] && branch=" \[\e[33m\]($branch)\[\e[0m\]"
-  PS1="\[\e[36m\]╭──\[\e[0m\] \[\e[32m\]\u@\h\[\e[0m\] \[\e[34m\]\w\[\e[0m\]$branch"
+  PS1=$'\n'
+  PS1+="\[\e[36m\]╭──\[\e[0m\] \[\e[32m\]\u@\h\[\e[0m\] \[\e[34m\]\w\[\e[0m\]$branch"
   if [[ $last -ne 0 ]]; then
     PS1+=" \[\e[31m\][exit $last]\[\e[0m\]"
   fi
