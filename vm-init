@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# vm-init - one-shot initial setup for a freshly cloned Ubuntu 24.04 VM.
+# vm-init - one-shot initial setup for a freshly cloned Ubuntu 24.04 / Debian 13 VM.
 #
 # Usage:
 #   sudo vm-init
@@ -63,7 +63,7 @@ trap 'err "vm-init failed during: ${STEP:-unknown} (line $LINENO: $BASH_COMMAND)
 banner() {
   local i
   printf '%s\n' "$CYAN╔$(printf '═%.0s' {1..58})╗$NC"
-  for i in "  VM-INIT   one-shot setup for a cloned Ubuntu 24.04 VM" \
+  for i in "  VM-INIT   for cloned Ubuntu 24.04 / Debian 13" \
            "  phase 1: answer the questions (nothing is changed yet)" \
            "  phase 2: review the plan, then confirm to execute"; do
     printf '%s%-58s%s\n' "$CYAN║" "$i" "$CYAN║$NC"
@@ -121,6 +121,34 @@ wait_for_apt() {
     sleep 2
   done
   die "apt is locked by another process (waited 120s)"
+}
+
+# Debian static: ifupdown's dns-nameservers only works with resolvconf or
+# systemd-resolved, so write resolv.conf directly when neither is present
+write_resolv_conf() {
+  command -v resolvconf >/dev/null 2>&1 && return 0
+  # systemd-resolved: ifupdown's /etc/network/if-up.d/resolved hook pushes
+  # dns-nameservers to resolved when the interface comes up
+  [[ -L /etc/resolv.conf ]] && return 0
+  local ns
+  {
+    for ns in ${DNS_LIST//,/ }; do
+      echo "nameserver $ns"
+    done
+    if [[ -n $SEARCH_DOMAIN ]]; then
+      echo "search ${SEARCH_DOMAIN//,/ }"
+    fi
+  } > /etc/resolv.conf
+  chmod 644 /etc/resolv.conf
+}
+
+apply_network() {
+  if [[ $DISTRO_ID == debian ]]; then
+    ifdown "$IFACE" 2>/dev/null || true
+    ifup "$IFACE"
+  else
+    netplan apply
+  fi
 }
 
 # ---- phase 1: collect answers (no changes) ------------------------------
@@ -283,39 +311,85 @@ execute() {
   # ---- 2/9 network ----
   STEP="network"
   echo; info "=== 2/9 Network ==="
-  local renderer
-  if systemctl is-active --quiet NetworkManager; then renderer=NetworkManager; else renderer=networkd; fi
-  rm -f /etc/netplan/50-cloud-init.yaml
-  {
-    echo "network:"
-    echo "  version: 2"
-    echo "  renderer: $renderer"
-    echo "  ethernets:"
-    echo "    $IFACE:"
+  if [[ $DISTRO_ID == debian ]]; then
+    # Debian: native ifupdown (/etc/network/interfaces), zero extra packages
+    command -v ifquery >/dev/null 2>&1 || \
+      die "ifupdown not installed; this template does not use /etc/network/interfaces"
+    # neutralize pre-existing stanzas for this interface in the main file and
+    # drop-ins (e.g. cloud-init's eni output): the iface block including its
+    # indented options, plus auto/allow-hotplug lines
+    for f in /etc/network/interfaces /etc/network/interfaces.d/*; do
+      [[ -f $f ]] || continue
+      if awk -v dev="$IFACE" '
+        $0 ~ "^auto[ \t]+" dev "[ \t]*$" || $0 ~ "^allow-hotplug[ \t]+" dev "[ \t]*$" { next }
+        $0 ~ "^iface[ \t]+" dev "[ \t]" { skip=1; next }
+        skip && /^[ \t]/ { next }
+        { skip=0; print }
+      ' "$f" > "$f.vm-init.tmp"; then
+        mv "$f.vm-init.tmp" "$f"
+      else
+        rm -f "$f.vm-init.tmp"
+        warn "Could not neutralize network stanza in $f"
+      fi
+    done
+    grep -q 'interfaces.d' /etc/network/interfaces || \
+      echo 'source-directory /etc/network/interfaces.d' >> /etc/network/interfaces
     if [[ $NET_MODE == static ]]; then
-      echo "      dhcp4: false"
-      echo "      dhcp6: false"
-      echo "      addresses:"
-      echo "        - $STATIC_IP"
-      echo "      routes:"
-      echo "        - to: default"
-      echo "          via: $GATEWAY"
-      echo "      nameservers:"
-      echo "        addresses: [${DNS_LIST// /}]"
-      if [[ -n $SEARCH_DOMAIN ]]; then
-        echo "        search: [$SEARCH_DOMAIN]"
-      fi
+      {
+        echo "auto $IFACE"
+        echo "iface $IFACE inet static"
+        echo "    address $STATIC_IP"
+        echo "    gateway $GATEWAY"
+        echo "    dns-nameservers ${DNS_LIST//,/ }"
+        if [[ -n $SEARCH_DOMAIN ]]; then
+          echo "    dns-search ${SEARCH_DOMAIN//,/ }"
+        fi
+      } > /etc/network/interfaces.d/99-vm-init
+      write_resolv_conf
     else
-      echo "      dhcp4: true"
-      echo "      dhcp6: false"
-      if [[ $renderer == networkd ]]; then
-        echo "      dhcp-identifier: mac"
-      fi
+      {
+        echo "auto $IFACE"
+        echo "iface $IFACE inet dhcp"
+      } > /etc/network/interfaces.d/99-vm-init
     fi
-  } > /etc/netplan/99-vm-init.yaml
-  chmod 600 /etc/netplan/99-vm-init.yaml
-  netplan generate || die "Invalid netplan config in /etc/netplan/99-vm-init.yaml. Re-run to fix."
-  ok "Netplan written and validated (applied at the end)"
+    ifquery "$IFACE" >/dev/null 2>&1 || die "Invalid ifupdown config in /etc/network/interfaces.d/99-vm-init. Re-run to fix."
+    ok "ifupdown config written and validated (applied at the end)"
+  else
+    # Ubuntu and others: netplan
+    local renderer
+    if systemctl is-active --quiet NetworkManager; then renderer=NetworkManager; else renderer=networkd; fi
+    rm -f /etc/netplan/50-cloud-init.yaml
+    {
+      echo "network:"
+      echo "  version: 2"
+      echo "  renderer: $renderer"
+      echo "  ethernets:"
+      echo "    $IFACE:"
+      if [[ $NET_MODE == static ]]; then
+        echo "      dhcp4: false"
+        echo "      dhcp6: false"
+        echo "      addresses:"
+        echo "        - $STATIC_IP"
+        echo "      routes:"
+        echo "        - to: default"
+        echo "          via: $GATEWAY"
+        echo "      nameservers:"
+        echo "        addresses: [${DNS_LIST// /}]"
+        if [[ -n $SEARCH_DOMAIN ]]; then
+          echo "        search: [$SEARCH_DOMAIN]"
+        fi
+      else
+        echo "      dhcp4: true"
+        echo "      dhcp6: false"
+        if [[ $renderer == networkd ]]; then
+          echo "      dhcp-identifier: mac"
+        fi
+      fi
+    } > /etc/netplan/99-vm-init.yaml
+    chmod 600 /etc/netplan/99-vm-init.yaml
+    netplan generate || die "Invalid netplan config in /etc/netplan/99-vm-init.yaml. Re-run to fix."
+    ok "Netplan written and validated (applied at the end)"
+  fi
 
   # ---- 3/9 time ----
   STEP="time"
@@ -388,7 +462,7 @@ execute() {
   apt-get upgrade -y -q
   apt-get install -y -q \
     curl wget git vim htop unzip jq rsync net-tools \
-    ca-certificates gnupg software-properties-common
+    ca-certificates gnupg
   ok "Base tools installed"
 
   info "Installing herdr (terminal multiplexer, https://herdr.dev) ..."
@@ -417,6 +491,7 @@ execute() {
   # ---- 6/9 MOTD ----
   STEP="motd"
   echo; info "=== 6/9 MOTD / welcome message ==="
+  mkdir -p /etc/update-motd.d
   cat > /etc/update-motd.d/99-vm-info <<'EOF'
 #!/bin/sh
 printf '\033[1;32mWelcome to %s\033[0m\n' "$(hostname)"
@@ -440,6 +515,7 @@ EOF
   # ESM ads, updates count); only our welcome banner remains
   rm -f /etc/update-motd.d/00-header \
         /etc/update-motd.d/10-help-text \
+        /etc/update-motd.d/10-uname \
         /etc/update-motd.d/50-landscape-sysinfo \
         /etc/update-motd.d/50-motd-news \
         /etc/update-motd.d/80-esm \
@@ -594,12 +670,12 @@ EOF
       info "Reboot scheduled in 5 seconds"
     fi
     info "Applying network config ..."
-    netplan apply
+    apply_network
     echo
     ok "Done. Reconnect to $STATIC_IP (or use the Proxmox console)."
     [[ $REBOOT_NOW == y ]] || info "Reboot when ready: sudo reboot"
   else
-    netplan apply
+    apply_network
     if [[ $REBOOT_NOW == y ]]; then
       reboot
     fi
@@ -615,10 +691,16 @@ main() {
   STEP="preflight"
   clear 2>/dev/null || true
   banner
-  warn "Run this on a fresh clone. Existing hostname, netplan and SSH settings will be changed."
+  warn "Run this on a fresh clone. Existing hostname, network and SSH settings will be changed."
   . /etc/os-release
-  if [[ ${ID:-} != ubuntu || ${VERSION_ID:-} != 24.04 ]]; then
+  DISTRO_ID=${ID:-}
+  DISTRO_VER=${VERSION_ID:-}
+  if [[ $DISTRO_ID == ubuntu && $DISTRO_VER != 24.04 ]]; then
     warn "Targets Ubuntu 24.04, this is ${PRETTY_NAME:-unknown}. Continuing anyway."
+  elif [[ $DISTRO_ID == debian && $DISTRO_VER != 13 ]]; then
+    warn "Targets Debian 13, this is ${PRETTY_NAME:-unknown}. Continuing anyway."
+  elif [[ $DISTRO_ID != ubuntu && $DISTRO_ID != debian ]]; then
+    warn "Targets Ubuntu 24.04 or Debian 13, this is ${PRETTY_NAME:-unknown}. Continuing anyway."
   fi
   if ! ping -c1 -W2 archive.ubuntu.com >/dev/null 2>&1; then
     warn "No network connectivity. If the clone has a stale IP this is expected; apt steps will fail loudly and can be re-run."
