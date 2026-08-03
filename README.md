@@ -26,6 +26,12 @@ sudo vm-init
 Every step asks a question with a default; press Enter to accept it. Safe to
 re-run.
 
+The script runs in two phases:
+
+1. **Collect**: answers every question up front. Nothing is changed yet.
+2. **Execute**: shows you the full plan, and applies everything only after you
+   confirm. Aborting at the plan screen leaves the VM untouched.
+
 ## What it does
 
 | Step | Description |
