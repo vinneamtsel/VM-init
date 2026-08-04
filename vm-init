@@ -123,13 +123,22 @@ wait_for_apt() {
   die "apt is locked by another process (waited 120s)"
 }
 
-# Debian static: ifupdown's dns-nameservers only works with resolvconf or
-# systemd-resolved, so write resolv.conf directly when neither is present
+# Debian static DNS. ifupdown's dns-nameservers only works with resolvconf or
+# systemd-resolved; for anything else write resolv.conf directly
 write_resolv_conf() {
   command -v resolvconf >/dev/null 2>&1 && return 0
-  # systemd-resolved: ifupdown's /etc/network/if-up.d/resolved hook pushes
-  # dns-nameservers to resolved when the interface comes up
-  [[ -L /etc/resolv.conf ]] && return 0
+  if [[ -L /etc/resolv.conf ]]; then
+    if systemctl is-active --quiet systemd-resolved; then
+      # resolved is running: push DNS to it, its stub serves 127.0.0.53
+      resolvectl dns "$IFACE" ${DNS_LIST//,/ } 2>/dev/null || true
+      if [[ -n $SEARCH_DOMAIN ]]; then
+        resolvectl domain "$IFACE" ${SEARCH_DOMAIN//,/ } 2>/dev/null || true
+      fi
+      return 0
+    fi
+    # stale symlink (resolved installed but not running): replace with a file
+    rm -f /etc/resolv.conf
+  fi
   local ns
   {
     for ns in ${DNS_LIST//,/ }; do
@@ -146,6 +155,11 @@ apply_network() {
   if [[ $DISTRO_ID == debian ]]; then
     ifdown "$IFACE" 2>/dev/null || true
     ifup "$IFACE"
+    if [[ $NET_MODE == static ]]; then
+      # stop the template's stale DHCP client, it would rewrite resolv.conf
+      pkill -f "dhclient.*$IFACE" 2>/dev/null || true
+      write_resolv_conf
+    fi
   else
     netplan apply
   fi
